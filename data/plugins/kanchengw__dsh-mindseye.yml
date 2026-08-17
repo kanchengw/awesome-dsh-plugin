@@ -1,0 +1,6 @@
+url: https://github.com/kanchengw/dsh-mindseye
+name: kanchengw/dsh-mindseye
+category: tools
+description:
+  en: Plug-in vision for text-only models in DSH, with native multimodal interaction, memory cache, and intent router.
+  zh: 为 DSH 中的纯文本模型提供视觉插件，支持原生图片交互、记忆缓存、意图路由。
