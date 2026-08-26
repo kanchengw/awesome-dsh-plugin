@@ -1,0 +1,341 @@
+name: Submit dsh-assembly.resume
+
+on:
+  schedule:
+    # The source repository reaches 24h 5m at 2026-08-26 11:30:01 UTC.
+    - cron: '31 11 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: submit-dsh-assembly-resume
+  cancel-in-progress: false
+
+env:
+  FORK_REPO: kanchengw/awesome-dsh-plugin
+  UPSTREAM_REPO: awesome-dsh-plugin/awesome-dsh-plugin
+  PLUGIN_REPO: kanchengw/dsh-assembly.resume
+  HEAD_BRANCH: add/dsh-assembly-resume
+  ENTRY_FILE: data/plugins/kanchengw__dsh-assembly.resume.yml
+  WORKFLOW_FILE: .github/workflows/submit-dsh-assembly-resume.yml
+
+jobs:
+  gate:
+    if: github.repository == 'kanchengw/awesome-dsh-plugin'
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.gate.outputs.action }}
+    steps:
+      - name: Check repository age and existing pull request
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?UPSTREAM_PR_TOKEN is not configured}"
+
+          created_at=$(gh api "repos/${PLUGIN_REPO}" --jq .created_at)
+          created_epoch=$(date -u -d "$created_at" +%s)
+          ready_epoch=$((created_epoch + 24 * 60 * 60 + 5 * 60))
+          now_epoch=$(date -u +%s)
+          existing_prs=$(gh api --method GET "repos/${UPSTREAM_REPO}/pulls" \
+            -f state=all -f "head=kanchengw:${HEAD_BRANCH}" --jq length)
+
+          if [ "$existing_prs" -gt 0 ]; then
+            echo "action=cleanup" >> "$GITHUB_OUTPUT"
+            echo "An upstream pull request already exists; only cleanup is needed."
+          elif [ "$now_epoch" -lt "$ready_epoch" ]; then
+            echo "action=wait" >> "$GITHUB_OUTPUT"
+            echo "Repository is not 24 hours 5 minutes old yet."
+          else
+            echo "action=submit" >> "$GITHUB_OUTPUT"
+            echo "Repository age requirement is satisfied."
+          fi
+
+  prepare:
+    needs: gate
+    if: needs.gate.outputs.action == 'submit'
+    runs-on: ubuntu-latest
+    outputs:
+      base_sha: ${{ steps.bundle.outputs.base_sha }}
+      source_sha: ${{ steps.refs.outputs.source_sha }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch authenticated refs through ghfast
+        id: refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          upstream_sha=$(gh api "repos/${UPSTREAM_REPO}/git/ref/heads/main" --jq .object.sha)
+          source_sha=$(gh api "repos/${FORK_REPO}/git/ref/heads/${HEAD_BRANCH}" --jq .object.sha)
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+          git init
+          git remote add origin "https://ghfast.top/https://github.com/${FORK_REPO}.git"
+          git remote add upstream "https://ghfast.top/https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags origin \
+            "refs/heads/${HEAD_BRANCH}:refs/remotes/origin/${HEAD_BRANCH}"
+          git fetch --no-tags upstream \
+            refs/heads/main:refs/remotes/upstream/main
+
+          test "$(git rev-parse "origin/${HEAD_BRANCH}")" = "$source_sha"
+          test "$(git rev-parse upstream/main)" = "$upstream_sha"
+
+      - name: Rebuild on current upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          entry_copy="$RUNNER_TEMP/kanchengw__dsh-assembly.resume.yml"
+          git show "origin/${HEAD_BRANCH}:${ENTRY_FILE}" > "$entry_copy"
+          git switch --detach upstream/main
+          cp "$entry_copy" "$ENTRY_FILE"
+
+          npm ci
+          node scripts/generate-readme.mjs
+
+          git config user.name kanchengw
+          git config user.email wangkancheng1122@163.com
+          git add "$ENTRY_FILE" README.md README.zh.md
+          git diff --cached --check
+          git commit -m 'add: list dsh-assembly.resume'
+
+      - name: Run pull request checks
+        shell: bash
+        env:
+          SKIP_PUBLISH_CHECKS: '1'
+        run: |
+          set -euo pipefail
+
+          stray=$(find data/plugins -type f ! -name '*.yml' -print)
+          if [ -n "$stray" ]; then
+            echo "$stray"
+            echo "::error::Files under data/plugins/ must end in .yml"
+            exit 1
+          fi
+
+          node scripts/generate-readme.mjs --check
+          npx awesome-lint
+          node scripts/build-site.mjs
+
+      - name: Run repository submission gate
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/check-submission.mjs \
+            --base upstream/main \
+            --pr-created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --json "$RUNNER_TEMP/submission-result.json"
+
+      - name: Verify and package the three-file submission
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+
+          expected=$(printf '%s\n' "$ENTRY_FILE" README.md README.zh.md | sort)
+          actual=$(/usr/bin/git diff --name-only upstream/main...HEAD | sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Submission contains unexpected files"
+            /usr/bin/git diff --name-status upstream/main...HEAD
+            exit 1
+          fi
+
+          base_sha=$(/usr/bin/git rev-parse upstream/main)
+          test "$(/usr/bin/git rev-parse HEAD^)" = "$base_sha"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          /usr/bin/git format-patch --stdout --binary \
+            "$base_sha..HEAD" > "$RUNNER_TEMP/submission.patch"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-assembly-resume-submission
+          path: ${{ runner.temp }}/submission.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [gate, prepare]
+    if: needs.gate.outputs.action == 'submit' && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsh-assembly-resume-submission
+          path: ${{ runner.temp }}
+
+      - name: Verify bundle on a clean runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          git init submission
+          git -C submission remote add upstream \
+            "https://ghfast.top/https://github.com/${UPSTREAM_REPO}.git"
+          authoritative_sha=$(gh api "repos/${UPSTREAM_REPO}/git/ref/heads/main" --jq .object.sha)
+          git -C submission fetch --no-tags upstream \
+            refs/heads/main:refs/remotes/upstream/main
+          test "$(git -C submission rev-parse upstream/main)" = "$authoritative_sha"
+
+          relation=$(gh api "repos/${UPSTREAM_REPO}/compare/${BASE_SHA}...main" --jq .status)
+          if [ "$relation" != ahead ] && [ "$relation" != identical ]; then
+            echo "::error::Prepared base is no longer an ancestor of upstream main"
+            exit 1
+          fi
+
+          git -C submission config user.name kanchengw
+          git -C submission config user.email wangkancheng1122@163.com
+          git -C submission switch --detach "$BASE_SHA"
+          git -C submission am "$RUNNER_TEMP/submission.patch"
+
+          test "$(git -C submission rev-list --count "$BASE_SHA..HEAD")" -eq 1
+          expected=$(printf '%s\n' "$ENTRY_FILE" README.md README.zh.md | sort)
+          actual=$(git -C submission diff --name-only "$BASE_SHA...HEAD" | sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Bundle contains unexpected files"
+            git -C submission diff --name-status "$BASE_SHA...HEAD"
+            exit 1
+          fi
+
+      - name: Push submission branch
+        id: push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          cd submission
+          git remote add origin "https://github.com/${FORK_REPO}.git"
+          gh auth setup-git
+          git push \
+            --force-with-lease="refs/heads/${HEAD_BRANCH}:${SOURCE_SHA}" \
+            origin "HEAD:refs/heads/${HEAD_BRANCH}"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify authoritative pull request diff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ steps.push.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          comparison=$(gh api "repos/${UPSTREAM_REPO}/compare/main...kanchengw:${HEAD_BRANCH}")
+          remote_head=$(gh api "repos/${FORK_REPO}/git/ref/heads/${HEAD_BRANCH}" --jq .object.sha)
+          if [ "$remote_head" != "$EXPECTED_HEAD" ] || ! jq -e \
+            --arg head "$EXPECTED_HEAD" \
+            --arg entry "$ENTRY_FILE" \
+            '.ahead_by == 1 and
+             .head_commit.sha == $head and
+             ([.files[] | {
+               filename,
+               status,
+               previous_filename: (.previous_filename // null)
+             }] | sort_by(.filename)) ==
+             ([
+               {filename: $entry, status: "added", previous_filename: null},
+               {filename: "README.md", status: "modified", previous_filename: null},
+               {filename: "README.zh.md", status: "modified", previous_filename: null}
+             ] | sort_by(.filename))' <<< "$comparison" >/dev/null; then
+            echo "::error::Remote pull request diff is not the expected three-file commit"
+            jq '{status, ahead_by, behind_by, head: .head_commit.sha, files}' <<< "$comparison"
+            exit 1
+          fi
+
+      - name: Create upstream pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+          EXPECTED_HEAD: ${{ steps.push.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          remote_head=$(gh api "repos/${FORK_REPO}/git/ref/heads/${HEAD_BRANCH}" --jq .object.sha)
+          if [ "$remote_head" != "$EXPECTED_HEAD" ]; then
+            echo "::error::Submission branch changed after verification"
+            exit 1
+          fi
+
+          existing_url=$(gh api --method GET "repos/${UPSTREAM_REPO}/pulls" \
+            -f state=all -f "head=kanchengw:${HEAD_BRANCH}" \
+            --jq '.[0].html_url // empty')
+          if [ -n "$existing_url" ]; then
+            echo "Pull request already exists: $existing_url"
+            exit 0
+          fi
+
+          body_file="$RUNNER_TEMP/pull-request-body.md"
+          cat > "$body_file" <<'BODY'
+          Adds `kanchengw/dsh-assembly.resume` to the Sessions & Messages category.
+
+          - [x] Added one plugin entry under `data/plugins/`
+          - [x] Regenerated both READMEs
+          - [x] Declares `dsh.bundle`
+          - [x] Repository is at least 1 day old with 10+ commits
+          - [x] Uses the `session` category
+          - [x] Description is factual and the repository has the `dsh-plugin` topic
+          BODY
+
+          set +e
+          create_output=$(gh pr create \
+              --repo "$UPSTREAM_REPO" \
+              --base main \
+              --head "kanchengw:${HEAD_BRANCH}" \
+              --title 'Add dsh-assembly.resume' \
+              --body-file "$body_file" 2>&1)
+          create_status=$?
+          set -e
+          if [ "$create_status" -eq 0 ]; then
+            echo "$create_output"
+            exit 0
+          fi
+
+          existing_url=$(gh api --method GET "repos/${UPSTREAM_REPO}/pulls" \
+            -f state=all -f "head=kanchengw:${HEAD_BRANCH}" \
+            --jq '.[0].html_url // empty')
+          if [ -n "$existing_url" ]; then
+            echo "Pull request exists after a concurrent create: $existing_url"
+            exit 0
+          fi
+          echo "$create_output" >&2
+          exit "$create_status"
+
+  cleanup:
+    needs: [gate, publish]
+    if: >-
+      always() &&
+      (needs.gate.outputs.action == 'cleanup' || needs.publish.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove the one-time secret and workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh secret delete UPSTREAM_PR_TOKEN --repo "$FORK_REPO"
+          workflow_sha=$(gh api --method GET \
+            "repos/${FORK_REPO}/contents/${WORKFLOW_FILE}" \
+            -f ref=main --jq .sha)
+          gh api --method DELETE \
+            "repos/${FORK_REPO}/contents/${WORKFLOW_FILE}" \
+            -f message='chore: remove completed Resume submission workflow' \
+            -f sha="$workflow_sha" \
+            -f branch=main >/dev/null
